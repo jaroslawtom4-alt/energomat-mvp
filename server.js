@@ -6,6 +6,7 @@ const path = require('path');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const Database = require('better-sqlite3');
+const nodemailer = require('nodemailer');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -54,6 +55,44 @@ CREATE TABLE IF NOT EXISTS chat_messages (
   FOREIGN KEY(lead_id) REFERENCES leads(id)
 );
 `);
+
+async function sendLeadEmail(lead) {
+  if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
+    console.log('Brak konfiguracji SMTP - mail nie został wysłany.');
+    return;
+  }
+
+  const transporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: Number(process.env.SMTP_PORT || 465),
+    secure: true,
+    auth: {
+      user: process.env.SMTP_USER,
+      pass: process.env.SMTP_PASS
+    }
+  });
+
+  await transporter.sendMail({
+    from: `"Energomat" <${process.env.SMTP_USER}>`,
+    to: process.env.LEAD_EMAIL_TO || process.env.SMTP_USER,
+    subject: `Nowy lead Energomat - ${lead.company}`,
+    text: `
+Nowy lead Energomat:
+
+Imię: ${lead.name}
+Firma: ${lead.company}
+Telefon: ${lead.phone}
+Email: ${lead.email}
+Taryfa: ${lead.tariff || '-'}
+Zużycie MWh/rok: ${lead.usage_mwh || '-'}
+Obecna cena: ${lead.current_price || '-'}
+Status: ${lead.status}
+Notatka: ${lead.note || '-'}
+
+Data: ${lead.created_at}
+    `
+  });
+}
 
 function createAdminIfMissing() {
   const email = process.env.ADMIN_EMAIL || 'admin@energomat.org';
@@ -129,7 +168,7 @@ app.get('/api/me', auth, (req, res) => {
   res.json({ user });
 });
 
-app.post('/api/leads', (req, res) => {
+app.post('/api/leads', async (req, res) => {
   const { name, company, phone, email, tariff, usage_mwh, current_price, note } = req.body;
   if (!name || !company || !phone || !email) {
     return res.status(400).json({ error: 'Uzupełnij imię, firmę, telefon i email.' });
@@ -147,6 +186,13 @@ app.post('/api/leads', (req, res) => {
   `).run(userId, name, company, phone, email, tariff || '', Number(usage_mwh) || 0, Number(current_price) || 0, note || '');
 
   const lead = db.prepare('SELECT * FROM leads WHERE id = ?').get(info.lastInsertRowid);
+
+  try {
+    await sendLeadEmail(lead);
+  } catch (e) {
+    console.log('Błąd wysyłki maila:', e.message);
+  }
+
   res.json({ lead });
 });
 
