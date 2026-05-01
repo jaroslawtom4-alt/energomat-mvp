@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="pl">
+<head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Rejestracja - Energomat</title><link rel="stylesheet" href="/style.css"/></head>
+<body>
+<nav class="nav"><a class="brand" href="/">EM <span>Energomat</span></a><div><a href="/login.html">Logowanie</a></div></nav>
+<main class="auth">
+  <section class="card">
+    <h1>Rejestracja klienta</h1>
+    <form id="registerForm" class="grid">
+      <input name="name" placeholder="Imię" required />
+      <input name="company" placeholder="Firma" />
+      <input name="email" type="email" placeholder="Email" required />
+      <input name="password" type="password" placeholder="Hasło min. 6 znaków" required />
+      <button class="btn" type="submit">Załóż konto</button>
+    </form>
+    <p id="status"></p>
+  </section>
+</main>
+<script src="/app.js"></script>
+</body></html>
