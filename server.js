@@ -6,17 +6,21 @@ const path = require('path');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const Database = require('better-sqlite3');
-const nodemailer = require('nodemailer');
+const { Resend } = require('resend'); // ✅ ZAMIANA
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'zmien_to_natychmiast';
 const db = new Database(path.join(__dirname, 'energomat.db'));
 
+// 🔐 RESEND
+const resend = new Resend(process.env.RESEND_API_KEY);
+
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
+// 🗄️ DB
 db.exec(`
 CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -56,44 +60,39 @@ CREATE TABLE IF NOT EXISTS chat_messages (
 );
 `);
 
+// 📧 NOWA FUNKCJA MAILA (RESEND)
 async function sendLeadEmail(lead) {
-  if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
-    console.log('Brak konfiguracji SMTP - mail nie został wysłany.');
+  if (!process.env.RESEND_API_KEY) {
+    console.log('Brak RESEND_API_KEY - mail nie wysłany');
     return;
   }
 
-  const transporter = nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
-    port: Number(process.env.SMTP_PORT || 465),
-    secure: true,
-    auth: {
-      user: process.env.SMTP_USER,
-      pass: process.env.SMTP_PASS
-    }
-  });
+  try {
+    await resend.emails.send({
+      from: 'onboarding@resend.dev',
+      to: process.env.LEAD_EMAIL_TO || 'twoj@email.pl',
+      subject: `Nowy lead Energomat - ${lead.company}`,
+      html: `
+        <h2>Nowy lead Energomat</h2>
+        <p><b>Imię:</b> ${lead.name}</p>
+        <p><b>Firma:</b> ${lead.company}</p>
+        <p><b>Telefon:</b> ${lead.phone}</p>
+        <p><b>Email:</b> ${lead.email}</p>
+        <p><b>Taryfa:</b> ${lead.tariff || '-'}</p>
+        <p><b>Zużycie:</b> ${lead.usage_mwh || '-'}</p>
+        <p><b>Cena:</b> ${lead.current_price || '-'}</p>
+        <p><b>Status:</b> ${lead.status}</p>
+        <p><b>Notatka:</b> ${lead.note || '-'}</p>
+      `
+    });
 
-  await transporter.sendMail({
-    from: `"Energomat" <${process.env.SMTP_USER}>`,
-    to: process.env.LEAD_EMAIL_TO || process.env.SMTP_USER,
-    subject: `Nowy lead Energomat - ${lead.company}`,
-    text: `
-Nowy lead Energomat:
-
-Imię: ${lead.name}
-Firma: ${lead.company}
-Telefon: ${lead.phone}
-Email: ${lead.email}
-Taryfa: ${lead.tariff || '-'}
-Zużycie MWh/rok: ${lead.usage_mwh || '-'}
-Obecna cena: ${lead.current_price || '-'}
-Status: ${lead.status}
-Notatka: ${lead.note || '-'}
-
-Data: ${lead.created_at}
-    `
-  });
+    console.log('✅ MAIL WYSŁANY');
+  } catch (e) {
+    console.log('❌ Błąd wysyłki maila:', e.message);
+  }
 }
 
+// 👤 ADMIN
 function createAdminIfMissing() {
   const email = process.env.ADMIN_EMAIL || 'admin@energomat.org';
   const password = process.env.ADMIN_PASSWORD || 'ZmienHaslo123!';
@@ -107,6 +106,7 @@ function createAdminIfMissing() {
 }
 createAdminIfMissing();
 
+// 🔐 AUTH
 function signToken(user) {
   return jwt.sign(
     { id: user.id, email: user.email, role: user.role, name: user.name },
@@ -124,129 +124,74 @@ function auth(req, res, next) {
     req.user = jwt.verify(token, JWT_SECRET);
     next();
   } catch {
-    res.status(401).json({ error: 'Sesja wygasła. Zaloguj się ponownie.' });
+    res.status(401).json({ error: 'Sesja wygasła.' });
   }
 }
 
 function requireAgent(req, res, next) {
   if (!['agent', 'admin'].includes(req.user.role)) {
-    return res.status(403).json({ error: 'Brak dostępu do CRM.' });
+    return res.status(403).json({ error: 'Brak dostępu.' });
   }
   next();
 }
 
+// 🔐 LOGIN / REGISTER
 app.post('/api/auth/register', (req, res) => {
   const { name, company, email, password } = req.body;
-  if (!name || !email || !password) return res.status(400).json({ error: 'Podaj imię, email i hasło.' });
-  if (password.length < 6) return res.status(400).json({ error: 'Hasło musi mieć minimum 6 znaków.' });
+  if (!name || !email || !password) return res.status(400).json({ error: 'Brak danych.' });
 
   try {
     const hash = bcrypt.hashSync(password, 10);
     const info = db.prepare('INSERT INTO users (name, company, email, password_hash, role) VALUES (?, ?, ?, ?, ?)')
       .run(name, company || '', email.toLowerCase(), hash, 'client');
+
     const user = db.prepare('SELECT id, name, company, email, role FROM users WHERE id = ?').get(info.lastInsertRowid);
     res.json({ token: signToken(user), user });
-  } catch (e) {
-    res.status(400).json({ error: 'Taki email już istnieje.' });
+  } catch {
+    res.status(400).json({ error: 'Email już istnieje.' });
   }
 });
 
 app.post('/api/auth/login', (req, res) => {
   const { email, password } = req.body;
   const user = db.prepare('SELECT * FROM users WHERE email = ?').get((email || '').toLowerCase());
+
   if (!user || !bcrypt.compareSync(password || '', user.password_hash)) {
-    return res.status(401).json({ error: 'Nieprawidłowy email lub hasło.' });
+    return res.status(401).json({ error: 'Błędne dane.' });
   }
+
   res.json({
     token: signToken(user),
     user: { id: user.id, name: user.name, company: user.company, email: user.email, role: user.role }
   });
 });
 
-app.get('/api/me', auth, (req, res) => {
-  const user = db.prepare('SELECT id, name, company, email, role, created_at FROM users WHERE id = ?').get(req.user.id);
-  res.json({ user });
-});
-
+// 🟢 LEAD
 app.post('/api/leads', async (req, res) => {
   const { name, company, phone, email, tariff, usage_mwh, current_price, note } = req.body;
-  if (!name || !company || !phone || !email) {
-    return res.status(400).json({ error: 'Uzupełnij imię, firmę, telefon i email.' });
-  }
 
-  let userId = null;
-  const header = req.headers.authorization || '';
-  if (header.startsWith('Bearer ')) {
-    try { userId = jwt.verify(header.slice(7), JWT_SECRET).id; } catch {}
+  if (!name || !company || !phone || !email) {
+    return res.status(400).json({ error: 'Uzupełnij dane.' });
   }
 
   const info = db.prepare(`
-    INSERT INTO leads (user_id, name, company, phone, email, tariff, usage_mwh, current_price, note)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(userId, name, company, phone, email, tariff || '', Number(usage_mwh) || 0, Number(current_price) || 0, note || '');
+    INSERT INTO leads (name, company, phone, email, tariff, usage_mwh, current_price, note)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(name, company, phone, email, tariff || '', Number(usage_mwh) || 0, Number(current_price) || 0, note || '');
 
   const lead = db.prepare('SELECT * FROM leads WHERE id = ?').get(info.lastInsertRowid);
 
-  try {
-    await sendLeadEmail(lead);
-  } catch (e) {
-    console.log('Błąd wysyłki maila:', e.message);
-  }
+  await sendLeadEmail(lead); // 🔥 TU DZIAŁA
 
   res.json({ lead });
 });
 
-app.get('/api/my/leads', auth, (req, res) => {
-  const leads = db.prepare('SELECT * FROM leads WHERE user_id = ? ORDER BY id DESC').all(req.user.id);
-  res.json({ leads });
-});
-
-app.get('/api/crm/leads', auth, requireAgent, (req, res) => {
-  const leads = db.prepare('SELECT * FROM leads ORDER BY id DESC').all();
-  res.json({ leads });
-});
-
-app.patch('/api/crm/leads/:id', auth, requireAgent, (req, res) => {
-  const { status, note } = req.body;
-  db.prepare('UPDATE leads SET status = COALESCE(?, status), note = COALESCE(?, note) WHERE id = ?')
-    .run(status || null, note || null, req.params.id);
-  res.json({ lead: db.prepare('SELECT * FROM leads WHERE id = ?').get(req.params.id) });
-});
-
-app.post('/api/chat', async (req, res) => {
-  const { message, lead_id } = req.body;
-  if (!message) return res.status(400).json({ error: 'Wpisz wiadomość.' });
-
-  let userId = null;
-  const header = req.headers.authorization || '';
-  if (header.startsWith('Bearer ')) {
-    try { userId = jwt.verify(header.slice(7), JWT_SECRET).id; } catch {}
-  }
-
-  db.prepare('INSERT INTO chat_messages (user_id, lead_id, author, message) VALUES (?, ?, ?, ?)')
-    .run(userId, lead_id || null, 'client', message);
-
-  const lower = message.toLowerCase();
-  let reply = 'Dziękuję za wiadomość. Doradca Energomat może pomóc porównać energię, gaz, taryfę i obecne koszty firmy.';
-  if (lower.includes('gaz')) reply = 'W sprawie gazu sprawdzimy zużycie, cenę za MWh, okres umowy i możliwość negocjacji warunków.';
-  if (lower.includes('oszcz')) reply = 'Aby policzyć oszczędność, potrzebujemy rocznego zużycia MWh, taryfy, operatora i obecnej ceny z faktury.';
-  if (lower.includes('agent') || lower.includes('doradc')) reply = 'Przekazuję rozmowę do doradcy. Uzupełnij formularz kontaktowy, aby lead trafił do CRM.';
-
-  db.prepare('INSERT INTO chat_messages (user_id, lead_id, author, message) VALUES (?, ?, ?, ?)')
-    .run(userId, lead_id || null, 'assistant', reply);
-
-  res.json({ reply });
-});
-
-app.get('/api/crm/chat', auth, requireAgent, (req, res) => {
-  const messages = db.prepare('SELECT * FROM chat_messages ORDER BY id DESC LIMIT 100').all();
-  res.json({ messages });
-});
-
+// 🌐 FRONT
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
+// 🚀 START
 app.listen(PORT, () => {
-  console.log(`Energomat MVP działa na porcie ${PORT}`);
+  console.log(`Energomat działa na porcie ${PORT}`);
 });
